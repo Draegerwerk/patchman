@@ -23,7 +23,7 @@ from defusedxml.lxml import _etree as etree
 from django.conf import settings
 from django.db import IntegrityError, DatabaseError, transaction
 
-from util import get_url, download_url
+from util import bunzip2, get_url, download_url, get_sha1
 from packages.models import ErratumReference, Erratum, PackageName, \
     Package, PackageUpdate
 from arch.models import MachineArchitecture, PackageArchitecture
@@ -79,17 +79,39 @@ def update_errata(force=False):
     """ Update CentOS errata from https://cefs.steve-meier.de/
         and mark packages that are security updates
     """
+    data = download_errata_checksum()
+    expected_checksum = parse_errata_checksum(data)
     data = download_errata()
-    if data:
-        parse_errata(data, force)
-        mark_security_updates()
+    actual_checksum = get_sha1(data)
+    if actual_checksum != expected_checksum:
+        e = 'CEFS checksum did not match, skipping errata parsing'
+        error_message.send(sender=None, text=e)
+    else:
+        if data:
+            parse_errata(bunzip2(data), force)
+            mark_security_updates()
+
+
+def download_errata_checksum():
+    """ Download CentOS errata checksum from https://cefs.steve-meier.de/
+    """
+    res = get_url('https://cefs.steve-meier.de/errata.latest.sha1')
+    return download_url(res, 'Downloading Errata Checksum:')
 
 
 def download_errata():
     """ Download CentOS errata from https://cefs.steve-meier.de/
     """
-    res = get_url('https://cefs.steve-meier.de/errata.latest.xml')
+    res = get_url('https://cefs.steve-meier.de/errata.latest.xml.bz2')
     return download_url(res, 'Downloading CentOS Errata:')
+
+
+def parse_errata_checksum(data):
+    """ Parse the errata checksum and return the bz2 checksum
+    """
+    for line in data.splitlines():
+        if line.endswith('errata.latest.xml.bz2'):
+            return line.split()[0]
 
 
 def parse_errata(data, force):
@@ -152,8 +174,10 @@ def parse_errata_children(e, children):
             e.releases.add(osgroup)
         elif c.tag == 'packages':
             pkg_str = c.text.replace('.rpm', '')
-            pkg_re = re.compile('(\S+)-(?:(\d*):)?(.*)-(~?\w+[\w.]*)\.(\S+)')  # noqa
-            name, epoch, ver, rel, arch = pkg_re.match(pkg_str).groups()
+            pkg_re = re.compile('(\S+)-(?:(\d*):)?(.*)-(~?\w+)[.+](~?\S+)\.(\S+)$')  # noqa
+            name, epoch, ver, rel, dist, arch = pkg_re.match(pkg_str).groups()
+            if dist:
+                rel = '{0!s}-{1!s}'.format(rel, dist)
             p_type = Package.RPM
             pkg = get_or_create_package(name, epoch, ver, rel, arch, p_type)
             e.packages.add(pkg)
